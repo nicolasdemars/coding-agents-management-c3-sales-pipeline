@@ -1,78 +1,59 @@
 # Diagnosis: S-014 August revenue discrepancy
 
-## Red reproduction
+## Red command
 
-The original application was exercised without creating a repository database:
+From the repository root, with the package installed or `PYTHONPATH=src`:
 
 ```powershell
-python -c "from pathlib import Path; from decimal import Decimal; from pipeline import ingest, load, report, transform; rows=ingest.read_all(Path('data/raw')); conn=load.connect(':memory:'); load.load(transform.transform_all(rows), conn); actual=dict(report.all_store_totals(conn))['S-014']; print(f'S-014 August total: {actual:.2f} EUR; expected: 56232.09 EUR'); assert actual == Decimal('56232.09'), f'finance mismatch: got {actual:.2f}, expected 56232.09'"
+pytest -q tests/test_pipeline.py::test_partner_store_monthly_total_matches_finance
 ```
 
-Observed result:
+Before the fix, the regression test failed with:
 
 ```text
-S-014 August total: 50043.47 EUR; expected: 56232.09 EUR
-AssertionError: finance mismatch: got 50043.47, expected 56232.09
+E       AssertionError: assert Decimal('50043.47') == Decimal('56232.09')
+1 failed
 ```
 
-The application reports **50,043.47 EUR**; Finance expects **56,232.09 EUR**. The gap is **6,188.62 EUR**.
-
-## Current documented behavior
-
-The README says that transformation “applies the discount and computes the net amount.” The implemented formula is:
+After the fix, the same command reports:
 
 ```text
-gross_amount = parse_amount(amount)
-discount_pct = parse_amount(discount_pct), or 0 when blank
-net_amount = round_to_cent(gross_amount × (100 − discount_pct) / 100)
+1 passed
 ```
 
-`quantity` is parsed and stored, but is not used in this calculation. Reporting sums the stored `net_amount` values for the store.
+## Cause
 
-For S-014, the 420 partner rows produce:
+Five amounts in the partner export use a non-breaking space as a thousands separator, for example `1 321,49`. `parse_amount` searched the raw text with a pattern that did not accept this separator, so it silently parsed that value as `1` instead of `1321.49`; the five resulting losses total exactly `6,188.62 EUR`, which is the complete difference reported by Finance.
 
-```text
-gross total: 52,448.67 EUR
-discounted net total: 50,043.47 EUR
-```
+The clue was that S-014 is the only store using the regional partner export. Inspecting values that contained characters outside the ordinary digit/comma format exposed the five affected rows.
 
-## Evidence against other explanations
+## Evidence and eliminated causes
 
-- **Quantity:** multiplying every stored net amount by quantity produces **125,415.28 EUR**, not 56,232.09 EUR. The repository does not document whether `amount` is a unit price or a line total.
-- **Rounding:** row-level cent rounding versus aggregate rounding changes the result by only a few cents, not 6,188.62 EUR.
-- **Duplicates:** all 2,080 transaction IDs across the three CSV files are unique. The partner file has 420 unique rows.
-- **Missing rows:** the partner export contains 420 rows for S-014, matching the transaction count stated in the bug report.
-- **Tax, fees, commission, VAT, and markup:** no such fields, rules, comments, tests, or documentation exist in the repository. No calculation can be justified from them.
-- **Gross-versus-net selection:** the S-014 gross total is 52,448.67 EUR, which also does not equal Finance’s 56,232.09 EUR.
+| Suspect checked | Observed value before the fix | Conclusion |
+|---|---:|---|
+| Missing or duplicate partner transactions | 420 rows and 420 unique transaction IDs | Row loss or de-duplication did not explain the revenue gap. |
+| Multiplying every current net amount by `quantity` | `125,415.28 EUR` | An omitted global quantity multiplication did not produce Finance's total. |
+| Aggregate rounding instead of row-level rounding | `0.12 EUR` difference | Rounding was far too small to explain `6,188.62 EUR`. |
+| Summing the un-discounted parsed amounts | `52,448.67 EUR` | Discount application alone did not explain the expected total. |
 
-## Concrete row trace
+The five malformed parses were:
 
-The first partner rows trace as follows:
-
-| Transaction | Raw amount | Quantity | Discount | Current net |
+| Transaction | Raw amount | Parsed before | Correct net after discount | Revenue loss |
 |---|---:|---:|---:|---:|
-| P-00000 | 91,83 | 4 | 10% | 82.65 |
-| P-00001 | 32,02 | 2 | 15% | 27.22 |
-| P-00002 | 153,13 | 3 | 10% | 137.82 |
-| P-00003 | 109,46 | 2 | blank | 109.46 |
-| P-00004 | 169,70 | 1 | blank | 169.70 |
+| P-00219 | `1 321,49` | 1.00 | 1,321.49 | 1,320.49 |
+| P-00272 | `1 613,17` | 1.00 | 1,613.17 | 1,612.17 |
+| P-00275 | `1 197,00` | 0.85 | 1,017.45 | 1,016.60 |
+| P-00298 | `1 070,51` | 0.90 | 963.46 | 962.56 |
+| P-00314 | `1 503,12` | 0.85 | 1,277.65 | 1,276.80 |
 
-For example, P-00000 is currently calculated as:
+Together, these losses are `6,188.62 EUR`. Correcting them changes the S-014 total from `50,043.47 EUR` to `56,232.09 EUR`.
 
-```text
-91.83 × (100 − 10) / 100 = 82.647 → 82.65 EUR
-```
+## Fix and regression coverage
 
-The report does not say whether that row should instead be treated as a unit price, a line total, a net amount, or something else. Therefore the row trace demonstrates the current behavior but does not establish a different correct value.
+`parse_amount` now removes non-breaking (`U+00A0`) and narrow non-breaking (`U+202F`) thousands separators before applying the existing decimal parser. The field-level test covers the exact regional number shape, and the pipeline-level regression test checks Finance's complete S-014 total using the real CSV fixtures.
 
-## Cause and conclusion
+The targeted regression test passes after the fix, and the complete suite reports `19 passed`.
 
-`BUG-REPORT.md` supplies the two aggregate values and confirms that the transaction count is 420, but it does not define the partner field contract for `amount`, `quantity`, or `discount_pct`. It also does not define any additional revenue component.
-
-The cause is therefore an under-specified business/data contract, not a demonstrable reporting formula defect. The finding belongs in the specification/data contract.
-
-No honest production fix can be selected without clarification from Finance or the partner-export owner. In particular, no formula should be invented from the target total alone.
-
-No application code was modified while producing this diagnosis.
+Finding location: the structure of the code — regional field normalization belongs in `pipeline.parse`, the boundary already responsible for reconciling exporter formats.
 
 More than 1h30: No

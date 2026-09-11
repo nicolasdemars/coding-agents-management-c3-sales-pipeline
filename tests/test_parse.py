@@ -12,6 +12,10 @@ def test_parses_decimal_comma():
     assert parse_amount("42,50") == Decimal("42.50")
 
 
+def test_parses_non_breaking_space_thousands_separator():
+    assert parse_amount("1\u00a0321,49") == Decimal("1321.49")
+
+
 def test_parses_negative_refund():
     assert parse_amount("-8.00") == Decimal("-8.00")
 
